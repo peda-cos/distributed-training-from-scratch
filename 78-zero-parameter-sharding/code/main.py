@@ -15,13 +15,14 @@ optimizer math are real; only the hardware is a local CPU.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import platform
 import tempfile
 import time
 import warnings
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Sequence
@@ -731,3 +732,492 @@ def train_reference(config: RunConfig) -> ReferenceRun:
         params=torch.stack(history),
         elapsed_s=time.perf_counter() - started,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-process runner and comparison
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ZeroRun:
+    config: RunConfig
+    rank_payloads: list[dict[str, Any]]
+    params_by_rank: list[Tensor]
+    elapsed_s: float
+    train_seconds: float
+
+    @property
+    def mean_losses(self) -> list[float]:
+        if not self.rank_payloads:
+            return []
+        return [
+            sum(payload["records"][step]["loss"] for payload in self.rank_payloads)
+            / self.config.world_size
+            for step in range(self.config.steps)
+        ]
+
+    @property
+    def memory(self) -> dict[str, int]:
+        return self.rank_payloads[0]["memory"]
+
+    @property
+    def comm(self) -> dict[str, int]:
+        return self.rank_payloads[0]["comm"]
+
+    @property
+    def spec(self) -> dict[str, int]:
+        return self.rank_payloads[0]["spec"]
+
+
+@dataclass
+class Comparison:
+    loss_deltas: list[float]
+    param_deltas: list[float]
+    replica_equal: list[bool]
+    loss_decreased: bool
+    max_loss_delta: float
+    max_param_delta: float
+    passed: bool
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
+def worker(rank: int, payload: dict[str, Any], output_dir: str) -> None:
+    config = RunConfig(**payload)
+    torch.set_num_threads(1)
+    torch.manual_seed(config.seed)
+
+    if config.device == "cuda":
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+    else:
+        device = torch.device("cpu")
+
+    output = Path(output_dir)
+    init_path = output / "rendezvous"
+    dist.init_process_group(
+        backend=config.backend,
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=config.world_size,
+        timeout=timedelta(seconds=COLLECTIVE_TIMEOUT_S),
+    )
+
+    try:
+        compute_dtype = config.torch_dtype
+        model = make_model(config.seed, config.hidden_dim, compute_dtype).to(device)
+        optimizer = ZeroOptimizer(model, config.world_size, rank, config.lr)
+        x, y = make_dataset(config.data_seed)
+        local_batch = config.batch_size // config.world_size
+        history = [flatten_params(model).float().cpu()]
+        records: list[dict[str, Any]] = []
+        memory: MeasuredMemory | None = None
+        if config.steps == 0:
+            memory = measure_memory(model, optimizer)
+
+        train_started = time.perf_counter()
+        for step in range(config.steps):
+            optimizer.zero_grad()
+            indices = batch_indices(
+                step, config.batch_size, x.shape[0], SHUFFLE_SEED
+            )
+            selected = indices[
+                rank * local_batch : (rank + 1) * local_batch
+            ]
+            xb = x[selected].to(device=device, dtype=compute_dtype)
+            yb = y[selected].to(device=device, dtype=compute_dtype)
+            loss = F.mse_loss(model(xb), yb)
+            loss.backward()
+            if step == 0:
+                memory = measure_memory(model, optimizer)
+            optimizer.step()
+            flat = flatten_params(model).float().cpu()
+            history.append(flat)
+            records.append(
+                {
+                    "step": step,
+                    "loss": float(loss.detach()),
+                    "param_sum": float(flat.double().sum()),
+                }
+            )
+        train_seconds = time.perf_counter() - train_started
+        if memory is None:
+            memory = measure_memory(model, optimizer)
+
+        result = {
+            "rank": rank,
+            "world_size": config.world_size,
+            "spec": optimizer.spec.as_dict(),
+            "compute_dtype": str(optimizer.compute_dtype),
+            "param_count": optimizer.total_numel,
+            "records": records,
+            "memory": memory.as_dict(),
+            "comm": optimizer.comm.as_dict(),
+            "train_seconds": train_seconds,
+        }
+        _write_json(output / f"rank-{rank}.json", result)
+        torch.save(
+            {"params": torch.stack(history)},
+            output / f"rank-{rank}-params.pt",
+        )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def run_zero(config: RunConfig) -> ZeroRun:
+    with tempfile.TemporaryDirectory(prefix="zero78-") as temporary:
+        output = Path(temporary)
+        started = time.perf_counter()
+        mp.spawn(
+            worker,
+            args=(asdict(config), str(output)),
+            nprocs=config.world_size,
+            join=True,
+        )
+        elapsed = time.perf_counter() - started
+
+        payloads: list[dict[str, Any]] = []
+        histories: list[Tensor] = []
+        for rank in range(config.world_size):
+            payloads.append(
+                json.loads((output / f"rank-{rank}.json").read_text())
+            )
+            loaded = torch.load(
+                output / f"rank-{rank}-params.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            histories.append(loaded["params"])
+
+    for rank, payload in enumerate(payloads):
+        if payload["rank"] != rank:
+            raise RuntimeError(
+                f"rank artifact mismatch: expected {rank}, got {payload['rank']}"
+            )
+    shapes = {tuple(history.shape) for history in histories}
+    if len(shapes) != 1:
+        raise RuntimeError(f"rank parameter histories have different shapes: {shapes}")
+
+    return ZeroRun(
+        config=config,
+        rank_payloads=payloads,
+        params_by_rank=histories,
+        elapsed_s=elapsed,
+        train_seconds=sum(
+            payload["train_seconds"] for payload in payloads
+        )
+        / config.world_size,
+    )
+
+
+def compare_runs(run: ZeroRun, reference: ReferenceRun) -> Comparison:
+    config = run.config
+    if config.steps != len(reference.records):
+        raise RuntimeError("reference and Zero step counts differ")
+    if len(run.rank_payloads) != config.world_size:
+        raise RuntimeError("rank payload count does not match world_size")
+
+    loss_deltas: list[float] = []
+    param_deltas: list[float] = []
+    replica_equal: list[bool] = []
+    losses = run.mean_losses
+
+    for step in range(config.steps):
+        loss_deltas.append(
+            abs(losses[step] - reference.records[step]["loss"])
+        )
+        replica_equal.append(
+            all(
+                torch.equal(
+                    run.params_by_rank[rank][step + 1],
+                    run.params_by_rank[0][step + 1],
+                )
+                for rank in range(config.world_size)
+            )
+        )
+        param_deltas.append(
+            max(
+                (
+                    run.params_by_rank[rank][step + 1]
+                    - reference.params[step + 1]
+                )
+                .abs()
+                .max()
+                .item()
+                for rank in range(config.world_size)
+            )
+        )
+
+    if config.steps < 6:
+        loss_decreased = True
+    else:
+        first = sum(losses[:3]) / 3
+        last = sum(losses[-3:]) / 3
+        loss_decreased = last < first
+
+    max_loss_delta = max(loss_deltas, default=0.0)
+    max_param_delta = max(param_deltas, default=0.0)
+    loss_tolerance = LOSS_TOLERANCE[config.torch_dtype]
+    param_tolerance = PARAM_TOLERANCE[config.torch_dtype]
+    passed = (
+        max_loss_delta <= loss_tolerance
+        and max_param_delta <= param_tolerance
+        and all(replica_equal)
+        and loss_decreased
+    )
+    return Comparison(
+        loss_deltas=loss_deltas,
+        param_deltas=param_deltas,
+        replica_equal=replica_equal,
+        loss_decreased=loss_decreased,
+        max_loss_delta=max_loss_delta,
+        max_param_delta=max_param_delta,
+        passed=passed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reporting and CLI
+# ---------------------------------------------------------------------------
+
+
+def shard_ranges(run: ZeroRun) -> list[tuple[int, int]]:
+    return [
+        (payload["spec"]["start"], payload["spec"]["end"])
+        for payload in run.rank_payloads
+    ]
+
+
+def print_projected_table(
+    num_params: int = 7_000_000_000,
+    world_sizes: tuple[int, ...] = (8, 64),
+) -> None:
+    print("projected per-rank memory, bf16 compute + fp32 master + Adam")
+    print(f"{'stage':<8} {'N':>3} {'GiB':>10} {'vs DDP':>8}")
+    print("-" * 32)
+    for world_size in world_sizes:
+        base = memory_budget(num_params, world_size, 0).total_bytes
+        for stage in (0, 1, 2, 3):
+            budget = memory_budget(num_params, world_size, stage)
+            label = "DDP" if stage == 0 else f"ZeRO-{stage}"
+            speedup = base / budget.total_bytes if budget.total_bytes else 0.0
+            print(
+                f"{label:<8} {world_size:>3} "
+                f"{format_gib(budget.total_bytes):>10} {speedup:>7.2f}x"
+            )
+    print()
+
+
+def print_measured_memory(config: RunConfig, run: ZeroRun) -> None:
+    memory = run.memory
+    spec = run.spec
+    total = spec["total_numel"]
+    shard = spec["shard_numel"]
+    param_bytes = 2 if config.dtype == "bf16" else 4
+    master_bytes = 0 if config.dtype == "fp32" else 4
+    ddp = memory_budget(
+        total,
+        config.world_size,
+        0,
+        param_bytes=param_bytes,
+        master_bytes=master_bytes,
+    )
+    zero_master = 4 * shard
+    zero_moments = 8 * shard
+    zero_total = memory["total_bytes"]
+    savings = 1.0 - zero_total / ddp.total_bytes if ddp.total_bytes else 0.0
+
+    print("per-rank resident tensor bytes at the first backward")
+    print(f"{'component':<14} {'DDP':>12} {'ZeRO-1':>12}")
+    print("-" * 40)
+    print(f"{'params':<14} {ddp.params_bytes:>12,} {memory['params_bytes']:>12,}")
+    print(f"{'grads':<14} {ddp.grads_bytes:>12,} {memory['grads_bytes']:>12,}")
+    print(f"{'master fp32':<14} {ddp.master_bytes:>12,} {zero_master:>12,}")
+    print(f"{'moment1 fp32':<14} {ddp.moments_bytes // 2:>12,} {zero_moments // 2:>12,}")
+    print(f"{'moment2 fp32':<14} {ddp.moments_bytes // 2:>12,} {zero_moments // 2:>12,}")
+    print(f"{'total':<14} {ddp.total_bytes:>12,} {zero_total:>12,}")
+    print(f"measured optimizer state: {memory['optimizer_bytes']:,} bytes "
+          f"(expected {12 * shard:,})")
+    print(f"total saving vs DDP: {savings * 100:.1f}%")
+    if config.dtype == "fp32":
+        print("fp32 note: the implementation keeps an explicit master shard.")
+    print()
+
+
+def print_comm_table(config: RunConfig, run: ZeroRun) -> None:
+    total = run.spec["total_numel"]
+    padded = run.spec["padded_numel"]
+    param_bytes = 2 if config.dtype == "bf16" else 4
+    if config.world_size == 1:
+        print("communication: no collectives (world_size=1)")
+        print()
+        return
+
+    comm = run.comm
+    steps = max(config.steps, 1)
+    ideal_rs, ideal_ag = zero_payload_bytes(
+        total, config.world_size, param_bytes
+    )
+    ddp_payload = ddp_payload_bytes(total, param_bytes)
+    zero_ring = ring_bandwidth_bytes(padded, config.world_size, param_bytes)
+    ddp_ring = ring_bandwidth_bytes(total, config.world_size, param_bytes)
+    print("communication per step")
+    print(
+        f"reduce_scatter calls={comm['reduce_scatter_calls']} "
+        f"bytes={format_bytes(comm['reduce_scatter_bytes'])} "
+        f"({comm['reduce_scatter_bytes'] / steps:,.0f}/step)"
+    )
+    print(
+        f"allgather calls={comm['allgather_calls']} "
+        f"bytes={format_bytes(comm['allgather_bytes'])} "
+        f"({comm['allgather_bytes'] / steps:,.0f}/step)"
+    )
+    print(
+        f"ZeRO payload/step={format_bytes(int(comm['payload_bytes'] / steps))} "
+        f"ideal={format_bytes(ideal_rs + ideal_ag)} "
+        f"padding overhead={format_bytes(ideal_rs + ideal_ag - ddp_payload)}"
+    )
+    print(
+        f"DDP allreduce payload/step={format_bytes(ddp_payload)}"
+    )
+    print(
+        f"ring bandwidth/rank/step: ZeRO={zero_ring:,.0f} "
+        f"DDP={ddp_ring:,.0f}"
+    )
+    print()
+
+
+def run_demo(config: RunConfig) -> int:
+    torch.set_num_threads(1)
+    print(
+        f"torch={torch.__version__} python={platform.python_version()} "
+        f"cpus={os.cpu_count()} platform={platform.platform()}"
+    )
+    total = (
+        INPUT_DIM * config.hidden_dim
+        + config.hidden_dim
+        + config.hidden_dim * config.hidden_dim
+        + config.hidden_dim
+        + config.hidden_dim
+        + 1
+    )
+    preview = shard_spec(total, config.world_size, 0)
+    print(
+        f"model=ThreeLayerMLP params={total} dtype={config.dtype} "
+        f"world_size={config.world_size} steps={config.steps} "
+        f"shard_numel={preview.shard_numel} padded={preview.padded_numel}"
+    )
+
+    reference = train_reference(config)
+    run = run_zero(config)
+    comparison = compare_runs(run, reference)
+    losses = run.mean_losses
+    loss_tolerance = LOSS_TOLERANCE[config.torch_dtype]
+    param_tolerance = PARAM_TOLERANCE[config.torch_dtype]
+
+    print()
+    print(
+        f"{'step':>4} {'zero_loss':>10} {'ref_loss':>10} {'dloss':>9} "
+        f"{'zero_sum':>13} {'ref_sum':>13} {'dsum':>9} "
+        f"{'max|dw|':>9} {'replicas':>8} result"
+    )
+    print("-" * 112)
+    for step in range(config.steps):
+        zero_sum = run.rank_payloads[0]["records"][step]["param_sum"]
+        ref_sum = reference.records[step]["param_sum"]
+        max_dw = comparison.param_deltas[step]
+        replica = comparison.replica_equal[step]
+        ok = (
+            comparison.loss_deltas[step] <= loss_tolerance
+            and max_dw <= param_tolerance
+            and replica
+        )
+        print(
+            f"{step:>4} {losses[step]:>10.6f} "
+            f"{reference.records[step]['loss']:>10.6f} "
+            f"{comparison.loss_deltas[step]:>9.2e} "
+            f"{zero_sum:>13.8f} {ref_sum:>13.8f} "
+            f"{zero_sum - ref_sum:>9.2e} {max_dw:>9.2e} "
+            f"{'exact' if replica else 'DIFF':>8} "
+            f"{'PASS' if ok else 'FAIL'}"
+        )
+    print()
+
+    print("rank shard ranges (global flat offsets):")
+    for rank, (start, end) in enumerate(shard_ranges(run)):
+        print(f"  rank {rank}: [{start}, {end}) owns {end - start}")
+    print()
+
+    print_measured_memory(config, run)
+    print_projected_table()
+    print_comm_table(config, run)
+
+    print(
+        f"max loss delta={comparison.max_loss_delta:.3e} "
+        f"max param delta={comparison.max_param_delta:.3e}"
+    )
+    print(
+        f"replicas exact={all(comparison.replica_equal)} "
+        f"loss decreased={comparison.loss_decreased}"
+    )
+    print(
+        f"reference_s={reference.elapsed_s:.3f} "
+        f"train_s={run.train_seconds:.3f} wall_s={run.elapsed_s:.3f}"
+    )
+    print("ALL CHECKS PASSED" if comparison.passed else "CHECKS FAILED")
+    return 0 if comparison.passed else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train a 3-layer MLP with ZeRO stage 1 optimizer-state sharding "
+            "over CPU gloo."
+        )
+    )
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
+    parser.add_argument("--world-size", type=int, default=DEFAULT_WORLD_SIZE)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
+    parser.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN)
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--data-seed", type=int, default=DATA_SEED)
+    parser.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument(
+        "--backend", choices=("gloo", "nccl"), default="gloo"
+    )
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        config = RunConfig(
+            world_size=args.world_size,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            hidden_dim=args.hidden,
+            lr=args.lr,
+            seed=args.seed,
+            data_seed=args.data_seed,
+            dtype=args.dtype,
+            backend=args.backend,
+            device=args.device,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if config.device == "cuda" and not torch.cuda.is_available():
+        parser.error("--device cuda requested but CUDA is not available")
+    return run_demo(config)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
