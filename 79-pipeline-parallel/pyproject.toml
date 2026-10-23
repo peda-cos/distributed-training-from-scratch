@@ -1,0 +1,28 @@
+[project]
+name = "pipeline-parallel-from-scratch"
+version = "0.1.0"
+description = "GPipe and 1F1B pipeline scheduling with real stagewise autograd, bubble fraction analysis, and stage balancing."
+requires-python = ">=3.14"
+dependencies = ["torch==2.15.0"]
+
+[dependency-groups]
+dev = ["pytest==9.2.0"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = [
+  "ignore:Failed to initialize NumPy.*:UserWarning",
+]
