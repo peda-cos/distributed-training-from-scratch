@@ -69,18 +69,17 @@ class ScheduleTrace:
     peak_activation_microbatches: int
 
 
-def _validate_schedule(schedule: str, num_stages: int, num_microbatches: int) -> str:
+def _validate_schedule(schedule: str, num_stages: int, num_microbatches: int) -> None:
     if schedule not in ("gpipe", "1f1b"):
         raise ValueError(f"unknown schedule {schedule!r}; expected 'gpipe' or '1f1b'")
     if num_stages <= 0:
         raise ValueError("num_stages must be positive")
     if num_microbatches <= 0:
         raise ValueError("num_microbatches must be positive")
-    return schedule
 
 
 def build_orders(
-    schedule: str,
+    schedule: ScheduleName,
     num_stages: int,
     num_microbatches: int,
 ) -> list[list[tuple[str, int]]]:
@@ -233,7 +232,7 @@ def simulate_schedule(
 
 
 def build_trace(
-    schedule: str,
+    schedule: ScheduleName,
     num_stages: int,
     num_microbatches: int,
     stage_cycles: Sequence[float] | None = None,
@@ -362,7 +361,7 @@ class Pipeline(nn.Module):
         self,
         stages: Sequence[PipelineStage],
         num_microbatches: int,
-        schedule: str = "gpipe",
+        schedule: ScheduleName = "gpipe",
         stage_cycles: Sequence[float] | None = None,
     ):
         super().__init__()
@@ -373,7 +372,7 @@ class Pipeline(nn.Module):
         _validate_schedule(schedule, len(stages), num_microbatches)
         self.stages = nn.ModuleList(stages)
         self.num_microbatches = num_microbatches
-        self.schedule = schedule
+        self.schedule: ScheduleName = schedule
         if stage_cycles is None:
             self.stage_cycles = tuple(stage.simulated_cycles for stage in stages)
         else:
@@ -497,7 +496,7 @@ def make_layer_stack(hidden_dim: int, dtype: torch.dtype = torch.float32) -> nn.
 
 def build_pipeline(
     config: RunConfig,
-    schedule: str = "gpipe",
+    schedule: ScheduleName = "gpipe",
     dtype: torch.dtype = torch.float32,
 ) -> Pipeline:
     """Build a deterministic 8-unit model split into equal contiguous stages."""
@@ -829,10 +828,8 @@ def _print_balance_table() -> bool:
     flops_trace = build_trace("gpipe", 4, 8, flops_cycles)
 
     print("stage balance, 4 stages, 12 blocks + embedding + head")
-    print(
-        "axis   stage layers       params        flops   util"
-    )
-    print("-------------------------------------------------------")
+    print("axis   stage layers       params        flops  flops/max")
+    print("-----------------------------------------------------------")
     for assignment in (params_assignment, flops_assignment):
         for stage, (layers, params, flops) in enumerate(
             zip(
@@ -844,12 +841,12 @@ def _print_balance_table() -> bool:
             print(
                 f"{assignment.axis:<6} {stage:<5} {layers:<6} "
                 f"{params:>12,} {flops:>13,} "
-                f"{flops / max(assignment.flops):7.2%}"
+                f"{flops / max(assignment.flops):9.2%}"
             )
         print(
             f"{assignment.axis:<6} total  {sum(assignment.layer_counts):<6} "
             f"{assignment.total_params:>12,} {assignment.total_flops:>13,} "
-            f"{assignment.compute_utilization:7.2%}"
+            f"compute utilization {assignment.compute_utilization:.2%}"
         )
     ratio = params_trace.makespan / flops_trace.makespan
     print(
