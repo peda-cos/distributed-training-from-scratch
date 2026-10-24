@@ -673,18 +673,27 @@ def partition_even(
         prefix.append(prefix[-1] + value)
 
     count = len(values)
-    infinity = float("inf")
-    dp = [[infinity] * (count + 1) for _ in range(num_stages + 1)]
+    dp: list[list[int | None]] = [
+        [None] * (count + 1) for _ in range(num_stages + 1)
+    ]
     cuts = [[-1] * (count + 1) for _ in range(num_stages + 1)]
-    dp[0][0] = 0.0
+    dp[0][0] = 0
     for parts in range(1, num_stages + 1):
         for end in range(parts, count + 1):
+            best: int | None = None
             for start in range(parts - 1, end):
+                previous = dp[parts - 1][start]
+                if previous is None:
+                    continue
                 stage_total = prefix[end] - prefix[start]
-                candidate = dp[parts - 1][start] + stage_total * stage_total
-                if candidate < dp[parts][end]:
-                    dp[parts][end] = candidate
+                candidate = previous + stage_total * stage_total
+                if best is None or candidate < best:
+                    best = candidate
                     cuts[parts][end] = start
+            dp[parts][end] = best
+
+    if dp[num_stages][count] is None:
+        raise RuntimeError("partition is infeasible")
 
     ranges: list[tuple[int, int]] = []
     end = count
