@@ -57,9 +57,12 @@ Simulated or limited:
   not include every tensor saved inside a stage's autograd graph.
 - **stage balance.** FLOPs and parameter counts are analytic formulas for a toy
   transformer, not hardware counters or profiler traces.
-- **scope.** Non-interleaved 1F1B only (one model chunk per rank). Megatron's
+- **Scope.** Non-interleaved 1F1B only (one model chunk per rank). Megatron's
   multi-chunk interleaved schedule, activation checkpointing, optimizer
-  convergence, and real multi-node execution are not implemented.
+  convergence, and real multi-node execution are not implemented. PyTorch's
+  `torch.distributed.pipeline.sync.Pipe` is deprecated and absent from the
+  pinned torch 2.15 CPU build, so the schedule and executor are implemented
+  directly rather than wrapping it.
 
 No paid API, external service, dataset download, or network call is involved
 in the demo or tests. `uv sync` is the only network-using step.
@@ -199,6 +202,20 @@ either receives. The standard ordering is:
 rendezvous: two send-first programs deadlock with zero steps; an even/odd pair
 completes both handoffs in two steps. Real NCCL/gloo transports may buffer more
 than zero messages, but the ordering rule removes the dependency on buffering.
+
+## Offline boundary and GPU mode
+
+`uv sync --frozen` downloads the pinned CPU wheels once. After that, the demo
+and the entire pytest suite run offline: there is no network call, paid API,
+external service, cloud sandbox, or dataset download in the execution path or
+the tests.
+
+No GPU mode is implemented or claimed. The model and executor use ordinary
+PyTorch tensors, so moving them to CUDA is mechanically possible, but this
+module has no CUDA/NCCL tests and reports only CPU measurements. A real
+multi-GPU pipeline would also need to replace the zero-cost handoff model with
+`torch.distributed` send/recv and pin each stage to a device; the schedule and
+bubble logic would remain the same.
 
 ## Quickstart
 
