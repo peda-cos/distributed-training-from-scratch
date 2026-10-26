@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.uv-cache/
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
+.checkpoints/
+checkpoints/
+.verify-demo/

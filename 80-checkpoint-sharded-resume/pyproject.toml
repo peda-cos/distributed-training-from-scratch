@@ -1,0 +1,17 @@
+[project]
+name = "checkpoint-sharded-resume-from-scratch"
+version = "0.1.0"
+description = "Sharded per-rank checkpoints with a SHA-256 manifest, atomic temp-then-rename commit, and exact ZeRO/Adam resume."
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest==9.2.0"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
