@@ -19,10 +19,12 @@ import struct
 import sys
 import tempfile
 import time
+import argparse
 import warnings
 from array import array
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from itertools import batched
 from pathlib import Path
 from typing import Any
@@ -55,6 +57,7 @@ CORPUS_TOKENS = 8192
 BATCH_PHASE_STRIDE = 16
 LOSS_NOISE_TOLERANCE = 1e-6
 COLLECTIVE_TIMEOUT_S = 120
+CHECKPOINT_ENTRY_BYTES = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -1355,3 +1358,518 @@ def verify_resume(
             f"rank {expected.rank}: checkpoint payload differs from snapshot"
         )
     return loaded
+
+
+# ---------------------------------------------------------------------------
+# Training worker, demo validation, and CLI
+# ---------------------------------------------------------------------------
+
+
+class ReplicaDivergenceError(RuntimeError):
+    """Ranks no longer hold identical parameters."""
+
+
+def assert_finite(
+    loss: Tensor, model: nn.Module, rank: int, step: int
+) -> None:
+    if not bool(torch.isfinite(loss.detach()).all()):
+        raise FloatingPointError(
+            f"non-finite loss at rank={rank} step={step}"
+        )
+    for name, parameter in model.named_parameters():
+        if parameter.grad is not None and not bool(
+            torch.isfinite(parameter.grad).all()
+        ):
+            raise FloatingPointError(
+                f"non-finite gradient for {name} at rank={rank} step={step}"
+            )
+
+
+def _batch_loss(model: nn.Module, inputs: Tensor, targets: Tensor) -> Tensor:
+    logits = model(inputs)
+    return F.cross_entropy(
+        logits.reshape(-1, VOCAB_SIZE), targets.reshape(-1)
+    )
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
+def _train_worker(rank: int, config_dict: dict[str, Any], run_dir: str) -> None:
+    config = RunConfig(**config_dict)
+    run_path = Path(run_dir)
+    torch.set_num_threads(1)
+
+    if config.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device requested but CUDA is unavailable")
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+    else:
+        device = torch.device("cpu")
+
+    dist.init_process_group(
+        backend=config.backend,
+        init_method=f"file://{run_path / 'rendezvous'}",
+        rank=rank,
+        world_size=config.world_size,
+        timeout=timedelta(seconds=COLLECTIVE_TIMEOUT_S),
+    )
+    try:
+        model = make_model(config.seed + rank)
+        pre_init_hash = state_digest(flatten_params(model))
+        ddp = DDPBroadcast(model, rank, config.world_size)
+        post_init_hash = state_digest(flatten_params(model))
+
+        count = parameter_count(model)
+        if count != PARAM_COUNT:
+            raise RuntimeError(
+                f"model has {count} parameters, expected {PARAM_COUNT}"
+            )
+        if count % config.world_size:
+            raise ValueError(
+                f"parameter count {count} is not divisible by world_size "
+                f"{config.world_size}; the 12P/N invariant requires exact shards"
+            )
+        optimizer = Zero1Optimizer(
+            model, rank, config.world_size, lr=config.lr
+        )
+
+        corpus = make_corpus(config.data_seed, CORPUS_TOKENS)
+        all_inputs, all_targets = make_batch(corpus, config.batch_size)
+        local_batch = config.batch_size // config.world_size
+        start = rank * local_batch
+        stop = start + local_batch
+        inputs = all_inputs[start:stop].to(device)
+        targets = all_targets[start:stop].to(device)
+
+        checkpoint_dir = run_path / "checkpoint"
+        records: list[dict[str, Any]] = []
+        memory: MemoryProfile | None = None
+        snapshot: RankState | None = None
+        train_started = time.perf_counter()
+
+        for step in range(1, config.steps + 1):
+            optimizer.zero_grad()
+            loss = _batch_loss(model, inputs, targets)
+            loss.backward()
+            assert_finite(loss, model, rank, step)
+            if step == 1:
+                memory = measure_memory(model, optimizer)
+            optimizer.step()
+
+            with torch.no_grad():
+                local_loss = _batch_loss(model, inputs, targets)
+            global_loss = ddp.mean(float(local_loss.detach()))
+
+            flat = flatten_params(model)
+            param_norm = float(torch.linalg.vector_norm(flat.float()).item())
+            param_hash = state_digest(flat)
+            if config.world_size == 1:
+                replica_equal = True
+            else:
+                norm_tensor = torch.tensor(
+                    [param_norm], dtype=torch.float64, device=device
+                )
+                digest_tensor = torch.tensor(
+                    list(bytes.fromhex(param_hash)),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                gathered_norms = [
+                    torch.empty_like(norm_tensor)
+                    for _ in range(config.world_size)
+                ]
+                gathered_digests = [
+                    torch.empty_like(digest_tensor)
+                    for _ in range(config.world_size)
+                ]
+                dist.all_gather(gathered_norms, norm_tensor)
+                dist.all_gather(gathered_digests, digest_tensor)
+                replica_equal = all(
+                    torch.equal(item, digest_tensor)
+                    and abs(float(gathered_norms[index].item()) - param_norm)
+                    <= 1e-12
+                    for index, item in enumerate(gathered_digests)
+                )
+            if not replica_equal:
+                raise ReplicaDivergenceError(
+                    f"rank {rank} diverged at step {step}"
+                )
+
+            if step == config.checkpoint_step:
+                snapshot = optimizer.local_state(flat)
+                entry = write_rank_shard(
+                    checkpoint_dir,
+                    step,
+                    snapshot,
+                    PARAM_COUNT,
+                    config.world_size,
+                )
+                dist.barrier()
+                entry_payload = json.dumps(
+                    entry.as_dict(), sort_keys=True
+                ).encode("utf-8")
+                if len(entry_payload) > CHECKPOINT_ENTRY_BYTES:
+                    raise CheckpointError("checkpoint entry metadata is too large")
+                entry_buffer = torch.zeros(
+                    CHECKPOINT_ENTRY_BYTES, dtype=torch.uint8, device=device
+                )
+                entry_buffer[: len(entry_payload)] = torch.tensor(
+                    list(entry_payload), dtype=torch.uint8, device=device
+                )
+                gathered_entries = [
+                    torch.empty_like(entry_buffer)
+                    for _ in range(config.world_size)
+                ]
+                dist.all_gather(gathered_entries, entry_buffer)
+                if rank == 0:
+                    entries: list[ShardEntry] = []
+                    for buffer in gathered_entries:
+                        raw = bytes(buffer.tolist()).rstrip(b"\x00")
+                        entries.append(
+                            ShardEntry.from_dict(json.loads(raw))
+                        )
+                    commit_manifest(
+                        checkpoint_dir,
+                        step,
+                        entries,
+                        PARAM_COUNT,
+                        config.world_size,
+                        snapshot.adam_step,
+                    )
+                dist.barrier()
+
+            records.append(
+                {
+                    "step": step,
+                    "loss": global_loss,
+                    "param_norm": param_norm,
+                    "param_hash": param_hash,
+                    "replica_equal": replica_equal,
+                    "checkpoint": step == config.checkpoint_step,
+                }
+            )
+
+        train_seconds = time.perf_counter() - train_started
+        if snapshot is None or memory is None:
+            raise RuntimeError("training completed without a checkpoint snapshot")
+
+        resume_error: Exception | None = None
+        try:
+            verify_resume(checkpoint_dir, snapshot, config.world_size)
+        except Exception as exc:  # noqa: BLE001 - report and fail through the group
+            resume_error = exc
+        resume_flag = torch.tensor(
+            1 if resume_error is None else 0,
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(resume_flag, op=dist.ReduceOp.MIN)
+        if int(resume_flag.item()) != 1:
+            raise CheckpointError(
+                f"resume verification failed on at least one rank: {resume_error}"
+            ) from resume_error
+
+        _write_json(
+            run_path / f"rank-{rank}.json",
+            {
+                "rank": rank,
+                "world_size": config.world_size,
+                "param_count": count,
+                "pre_init_hash": pre_init_hash,
+                "post_init_hash": post_init_hash,
+                "records": records,
+                "memory": memory.as_dict(),
+                "comm": optimizer.comm.as_dict(),
+                "resume_verified": True,
+                "checkpoint_step": config.checkpoint_step,
+                "train_seconds": train_seconds,
+                "device": str(device),
+            },
+        )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def run_distributed(
+    config: RunConfig, run_dir: str | Path
+) -> list[dict[str, Any]]:
+    run_path = Path(run_dir).resolve()
+    run_path.mkdir(parents=True, exist_ok=True)
+    try:
+        mp.spawn(
+            _train_worker,
+            args=(asdict(config), str(run_path)),
+            nprocs=config.world_size,
+            join=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the child failure message
+        raise RuntimeError(f"distributed training failed: {exc}") from exc
+    payloads: list[dict[str, Any]] = []
+    for rank in range(config.world_size):
+        path = run_path / f"rank-{rank}.json"
+        if not path.is_file():
+            raise RuntimeError(f"rank {rank} did not write {path.name}")
+        payloads.append(json.loads(path.read_text()))
+    return payloads
+
+
+def validate_run(
+    config: RunConfig,
+    payloads: Sequence[dict[str, Any]],
+    checkpoint_dir: str | Path,
+) -> list[str]:
+    failures: list[str] = []
+    if len(payloads) != config.world_size:
+        failures.append(
+            f"expected {config.world_size} rank payloads, got {len(payloads)}"
+        )
+        return failures
+    ordered = sorted(payloads, key=lambda payload: payload.get("rank", -1))
+    if [payload.get("rank") for payload in ordered] != list(
+        range(config.world_size)
+    ):
+        failures.append("rank payloads are not contiguous from 0")
+        return failures
+    for payload in ordered:
+        if payload.get("world_size") != config.world_size:
+            failures.append(f"rank {payload.get('rank')} world_size mismatch")
+        if payload.get("param_count") != PARAM_COUNT:
+            failures.append(f"rank {payload.get('rank')} parameter count mismatch")
+        if len(payload.get("records", [])) != config.steps:
+            failures.append(f"rank {payload.get('rank')} record count mismatch")
+        if not payload.get("resume_verified"):
+            failures.append(f"rank {payload.get('rank')} did not verify resume")
+    if any(len(payload.get("records", [])) != config.steps for payload in ordered):
+        return failures
+
+    reference = ordered[0].get("records", [])
+    if len(reference) == config.steps:
+        losses = [float(record["loss"]) for record in reference]
+        for step in range(1, len(losses)):
+            if losses[step] > losses[step - 1] + LOSS_NOISE_TOLERANCE:
+                failures.append(
+                    f"loss not monotonic at step {step + 1}: "
+                    f"{losses[step]:.8f} > {losses[step - 1]:.8f}"
+                )
+        for index in range(len(reference)):
+            ranks = [payload["records"][index] for payload in ordered]
+            hashes = {record["param_hash"] for record in ranks}
+            norms = [float(record["param_norm"]) for record in ranks]
+            step_losses = [float(record["loss"]) for record in ranks]
+            if len(hashes) != 1:
+                failures.append(f"parameter hashes differ at step {index + 1}")
+            if max(norms) - min(norms) > 1e-12:
+                failures.append(f"parameter norms differ at step {index + 1}")
+            if max(step_losses) - min(step_losses) > 1e-6:
+                failures.append(f"losses differ across ranks at step {index + 1}")
+            if not all(record["replica_equal"] for record in ranks):
+                failures.append(f"replica flag false at step {index + 1}")
+
+    expected_optimizer = 12 * PARAM_COUNT // config.world_size
+    for payload in ordered:
+        memory = payload.get("memory") or {}
+        if memory.get("optimizer_bytes") != expected_optimizer:
+            failures.append(
+                f"rank {payload.get('rank')} optimizer bytes "
+                f"{memory.get('optimizer_bytes')} != {expected_optimizer}"
+            )
+        if not memory.get("formula_ok"):
+            failures.append(f"rank {payload.get('rank')} formula flag false")
+
+    try:
+        loaded = load_checkpoint(checkpoint_dir, config.world_size)
+    except Exception as exc:  # noqa: BLE001 - surface the validation failure
+        failures.append(f"checkpoint load failed: {exc}")
+        return failures
+    if loaded.step != config.checkpoint_step:
+        failures.append(
+            f"checkpoint step {loaded.step} != {config.checkpoint_step}"
+        )
+    if loaded.manifest.param_numel != PARAM_COUNT:
+        failures.append("checkpoint parameter count mismatch")
+    if loaded.manifest.adam_step != config.checkpoint_step:
+        failures.append("checkpoint Adam step mismatch")
+    if len(loaded.manifest.shards) != config.world_size:
+        failures.append("checkpoint shard count mismatch")
+    if not (loaded.step_dir / MANIFEST_NAME).is_file():
+        failures.append("checkpoint manifest is missing")
+    return failures
+
+
+def print_report(
+    config: RunConfig,
+    payloads: Sequence[dict[str, Any]],
+    loaded: LoadedCheckpoint | None,
+    failures: Sequence[str],
+) -> None:
+    ordered = sorted(payloads, key=lambda payload: payload["rank"])
+    reference = ordered[0]["records"] if ordered else []
+    print(f"LOSS CURVE (global mean, {config.steps} steps)")
+    print(
+        f"{'step':>4} {'loss':>12} {'delta':>12} {'param_norm':>14} "
+        f"{'replicas':>9} ckpt"
+    )
+    print("-" * 68)
+    previous: float | None = None
+    for record in reference:
+        loss = float(record["loss"])
+        delta = "     -" if previous is None else f"{loss - previous: .6e}"
+        print(
+            f"{int(record['step']):>4} {loss:>12.6f} {delta:>12} "
+            f"{float(record['param_norm']):>14.8f} "
+            f"{'same' if record['replica_equal'] else 'DIFF':>9} "
+            f"{'CP' if record['checkpoint'] else ''}"
+        )
+        previous = loss
+    print()
+
+    print("MEMORY PROFILE (persistent tensors after step 1 backward)")
+    print(
+        f"{'rank':>4} {'params_B':>9} {'grads_B':>9} {'optimizer_B':>11} "
+        f"{'total_B':>9} {'formula_12P/N':>13} result"
+    )
+    print("-" * 76)
+    for payload in ordered:
+        memory = payload["memory"]
+        print(
+            f"{int(payload['rank']):>4} {int(memory['params_bytes']):>9} "
+            f"{int(memory['grads_bytes']):>9} "
+            f"{int(memory['optimizer_bytes']):>11} "
+            f"{int(memory['total_bytes']):>9} "
+            f"{int(memory['formula_bytes']):>13} "
+            f"{'PASS' if memory['formula_ok'] else 'FAIL'}"
+        )
+    print()
+
+    print("CHECKPOINT MANIFEST")
+    if loaded is None:
+        print("unavailable")
+    else:
+        manifest = loaded.manifest
+        print(
+            f"world_size={manifest.world_size} step={manifest.step} "
+            f"param_numel={manifest.param_numel} "
+            f"shard_numel={manifest.shard_numel} adam_step={manifest.adam_step} "
+            f"optimizer_bytes_per_rank={manifest.optimizer_bytes_per_rank}"
+        )
+        for entry in manifest.shards:
+            print(
+                f"rank{entry.rank} {entry.path} "
+                f"numel={entry.param_shard_numel} "
+                f"sha256={entry.sha256[:16]}..."
+            )
+        print(f"path={loaded.step_dir}")
+    print()
+
+    print("RESUME CHECK")
+    for payload in ordered:
+        print(
+            f"rank{payload['rank']} "
+            f"{'byte-equal' if payload['resume_verified'] else 'MISMATCH'}"
+        )
+    verified = all(bool(payload.get("resume_verified")) for payload in ordered)
+    print(
+        f"RESUME VERIFIED ({len(ordered)}/{config.world_size} rank shards byte-equal)"
+        if verified
+        else f"RESUME NOT VERIFIED ({sum(bool(payload.get('resume_verified')) for payload in ordered)}/{config.world_size})"
+    )
+    print()
+    if failures:
+        for failure in failures:
+            print(f"FAIL: {failure}")
+        print("CHECKS FAILED")
+    else:
+        print("ALL CHECKS PASSED")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train a 2-layer MiniGPT for 20 steps across simulated ranks with "
+            "DDP init sync, ZeRO-1 optimizer sharding, and a byte-verified "
+            "sharded checkpoint."
+        )
+    )
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
+    parser.add_argument("--world-size", type=int, default=DEFAULT_WORLD_SIZE)
+    parser.add_argument(
+        "--checkpoint-step", type=int, default=DEFAULT_CHECKPOINT_STEP
+    )
+    parser.add_argument(
+        "--checkpoint-root", type=Path, default=Path("checkpoints")
+    )
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--data-seed", type=int, default=DEFAULT_DATA_SEED)
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--backend", choices=("gloo", "nccl"), default="gloo"
+    )
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        config = RunConfig(
+            world_size=args.world_size,
+            steps=args.steps,
+            checkpoint_step=args.checkpoint_step,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            data_seed=args.data_seed,
+            backend=args.backend,
+            device=args.device,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if PARAM_COUNT % config.world_size:
+        parser.error(
+            "world_size must divide the 30144 model parameters so the "
+            "12P/N memory formula is exact"
+        )
+    if config.device == "cuda" and not torch.cuda.is_available():
+        parser.error("--device cuda requested but CUDA is not available")
+
+    root = args.checkpoint_root
+    root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=root)).resolve()
+    checkpoint_dir = run_dir / "checkpoint"
+    print(
+        f"config world_size={config.world_size} steps={config.steps} "
+        f"batch_size={config.batch_size} seq_len={SEQ_LEN} "
+        f"d_model={D_MODEL} heads={N_HEADS} layers={N_LAYERS} "
+        f"lr={config.lr} dtype=bf16 backend={config.backend} "
+        f"device={config.device}"
+    )
+    print(f"run_dir={run_dir}")
+    print(f"checkpoint={checkpoint_dir}")
+    print()
+
+    try:
+        payloads = run_distributed(config, run_dir)
+        failures = validate_run(config, payloads, checkpoint_dir)
+        try:
+            loaded = load_checkpoint(checkpoint_dir, config.world_size)
+        except Exception as exc:  # noqa: BLE001 - report malformed checkpoint
+            loaded = None
+            failures.append(f"checkpoint load failed: {exc}")
+    except Exception as exc:  # noqa: BLE001 - keep the demo self-terminating
+        print(f"DEMO FAILED: {exc}", file=sys.stderr)
+        return 1
+
+    print_report(config, payloads, loaded, failures)
+    return 0 if not failures else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
