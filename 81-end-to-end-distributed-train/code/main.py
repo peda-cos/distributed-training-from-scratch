@@ -271,3 +271,370 @@ def decode_fp32_le(data: bytes) -> array:
 def state_digest(flat: Tensor) -> str:
     values = flat.detach().float().cpu().reshape(-1).tolist()
     return hashlib.sha256(encode_fp32_le(values)).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Run configuration and flat-shard planning
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    world_size: int = DEFAULT_WORLD_SIZE
+    steps: int = DEFAULT_STEPS
+    checkpoint_step: int = DEFAULT_CHECKPOINT_STEP
+    batch_size: int = BATCH_SIZE
+    lr: float = DEFAULT_LR
+    seed: int = DEFAULT_SEED
+    data_seed: int = DEFAULT_DATA_SEED
+    backend: str = "gloo"
+    device: str = "cpu"
+
+    def __post_init__(self) -> None:
+        if type(self.world_size) is not int or self.world_size < 1:
+            raise ValueError("world_size must be a positive integer")
+        if type(self.steps) is not int or self.steps < 1:
+            raise ValueError("steps must be a positive integer")
+        if (
+            type(self.checkpoint_step) is not int
+            or not 1 <= self.checkpoint_step <= self.steps
+        ):
+            raise ValueError("checkpoint_step must be in [1, steps]")
+        if type(self.batch_size) is not int or self.batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        if self.batch_size % self.world_size:
+            raise ValueError("batch_size must be divisible by world_size")
+        if type(self.seed) is not int or self.seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        if type(self.data_seed) is not int or self.data_seed < 0:
+            raise ValueError("data_seed must be a non-negative integer")
+        if self.lr <= 0:
+            raise ValueError("lr must be positive")
+        if self.backend not in ("gloo", "nccl"):
+            raise ValueError(f"unsupported backend {self.backend!r}")
+        if self.device not in ("cpu", "cuda"):
+            raise ValueError(f"unsupported device {self.device!r}")
+        if self.device == "cpu" and self.backend == "nccl":
+            raise ValueError("the nccl backend requires a CUDA device")
+        if self.device == "cuda" and self.backend != "nccl":
+            raise ValueError("the cuda device requires the nccl backend")
+
+
+def ceil_div(numerator: int, denominator: int) -> int:
+    if denominator <= 0:
+        raise ValueError("denominator must be positive")
+    return -(-numerator // denominator)
+
+
+def partition_lengths(total_numel: int, world_size: int) -> list[int]:
+    if type(total_numel) is not int or total_numel < 1:
+        raise ValueError("total_numel must be a positive integer")
+    if type(world_size) is not int or world_size < 1:
+        raise ValueError("world_size must be a positive integer")
+    if total_numel < world_size:
+        raise ValueError("total_numel must be at least world_size")
+    shard_numel = ceil_div(total_numel, world_size)
+    return [shard_numel] * (world_size - 1) + [
+        total_numel - shard_numel * (world_size - 1)
+    ]
+
+
+@dataclass(frozen=True)
+class ShardSpec:
+    total_numel: int
+    world_size: int
+    rank: int
+    shard_numel: int
+    padded_numel: int
+    start: int
+    end: int
+
+    @property
+    def local_numel(self) -> int:
+        return self.end - self.start
+
+    @property
+    def owns_any(self) -> bool:
+        return self.start < self.end
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "total_numel": self.total_numel,
+            "world_size": self.world_size,
+            "rank": self.rank,
+            "shard_numel": self.shard_numel,
+            "padded_numel": self.padded_numel,
+            "start": self.start,
+            "end": self.end,
+            "local_numel": self.local_numel,
+        }
+
+
+def shard_spec(total_numel: int, world_size: int, rank: int) -> ShardSpec:
+    if type(total_numel) is not int or total_numel < 1:
+        raise ValueError("total_numel must be a positive integer")
+    if type(world_size) is not int or world_size < 1:
+        raise ValueError("world_size must be a positive integer")
+    if type(rank) is not int or not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    shard_numel = ceil_div(total_numel, world_size)
+    padded_numel = shard_numel * world_size
+    start = min(rank * shard_numel, total_numel)
+    end = min(start + shard_numel, total_numel)
+    return ShardSpec(
+        total_numel=total_numel,
+        world_size=world_size,
+        rank=rank,
+        shard_numel=shard_numel,
+        padded_numel=padded_numel,
+        start=start,
+        end=end,
+    )
+
+
+def pad_flat(flat: Tensor, spec: ShardSpec) -> Tensor:
+    if flat.dim() != 1:
+        raise ValueError("flat must be one-dimensional")
+    if flat.numel() != spec.total_numel:
+        raise ValueError(
+            f"flat has {flat.numel()} elements, expected {spec.total_numel}"
+        )
+    if flat.numel() == spec.padded_numel:
+        return flat.contiguous()
+    padded = flat.new_zeros(spec.padded_numel)
+    padded[: flat.numel()].copy_(flat)
+    return padded
+
+
+@dataclass
+class CommStats:
+    reduce_scatter_calls: int = 0
+    allgather_calls: int = 0
+    reduce_scatter_bytes: int = 0
+    allgather_bytes: int = 0
+
+    @property
+    def calls(self) -> int:
+        return self.reduce_scatter_calls + self.allgather_calls
+
+    @property
+    def payload_bytes(self) -> int:
+        return self.reduce_scatter_bytes + self.allgather_bytes
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "reduce_scatter_calls": self.reduce_scatter_calls,
+            "allgather_calls": self.allgather_calls,
+            "reduce_scatter_bytes": self.reduce_scatter_bytes,
+            "allgather_bytes": self.allgather_bytes,
+            "calls": self.calls,
+            "payload_bytes": self.payload_bytes,
+        }
+
+
+# ---------------------------------------------------------------------------
+# DDP init broadcast and scalar reduction
+# ---------------------------------------------------------------------------
+
+
+class DDPBroadcast:
+    """The DDP init-sync portion used by the ZeRO-1 composition."""
+
+    def __init__(self, model: nn.Module, rank: int, world_size: int) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("DDPBroadcast requires an initialized process group")
+        if dist.get_rank() != rank or dist.get_world_size() != world_size:
+            raise RuntimeError(
+                f"process group rank/world ({dist.get_rank()}/{dist.get_world_size()}) "
+                f"does not match ({rank}/{world_size})"
+            )
+        self.rank = rank
+        self.world_size = world_size
+        self.device = next(model.parameters()).device
+        if world_size > 1:
+            with torch.no_grad():
+                for tensor in list(model.parameters()) + list(model.buffers()):
+                    dist.broadcast(tensor.data, src=0)
+
+    def mean(self, value: float) -> float:
+        if self.world_size == 1:
+            return float(value)
+        tensor = torch.tensor(float(value), dtype=torch.float32, device=self.device)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return float(tensor.item()) / self.world_size
+
+
+# ---------------------------------------------------------------------------
+# ZeRO-1 optimizer: reduce-scatter grads, Adam on a local shard, all-gather
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MemoryProfile:
+    params_bytes: int
+    grads_bytes: int
+    optimizer_bytes: int
+    total_bytes: int
+    formula_bytes: int
+    formula_ok: bool
+
+    def as_dict(self) -> dict[str, int | bool]:
+        return {
+            "params_bytes": self.params_bytes,
+            "grads_bytes": self.grads_bytes,
+            "optimizer_bytes": self.optimizer_bytes,
+            "total_bytes": self.total_bytes,
+            "formula_bytes": self.formula_bytes,
+            "formula_ok": self.formula_ok,
+        }
+
+
+class Zero1Optimizer:
+    """Adam over a sharded fp32 master with real collectives."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        rank: int,
+        world_size: int,
+        lr: float = DEFAULT_LR,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+    ) -> None:
+        self.model = model
+        self.rank = rank
+        self.world_size = world_size
+        self.lr = lr
+        self.betas = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.params = _parameter_list(model)
+        self.compute_dtype = self.params[0].dtype
+        self.device = self.params[0].device
+        self.total_numel = sum(parameter.numel() for parameter in self.params)
+        self.spec = shard_spec(self.total_numel, world_size, rank)
+        self.master = torch.zeros(
+            self.spec.shard_numel, dtype=torch.float32, device=self.device
+        )
+        self.exp_avg = torch.zeros_like(self.master)
+        self.exp_avg_sq = torch.zeros_like(self.master)
+        flat = flatten_params(model)
+        self.master[: self.spec.local_numel].copy_(
+            flat[self.spec.start : self.spec.end].float()
+        )
+        self.step_count = 0
+        self.comm = CommStats()
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            if dist.get_rank() != rank or dist.get_world_size() != world_size:
+                raise RuntimeError(
+                    "process group rank/world does not match the optimizer"
+                )
+
+    def zero_grad(self) -> None:
+        self.model.zero_grad(set_to_none=True)
+
+    def _require_group(self) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError(
+                "Zero1Optimizer with world_size > 1 requires torch.distributed"
+            )
+        if dist.get_rank() != self.rank or dist.get_world_size() != self.world_size:
+            raise RuntimeError(
+                "process group rank/world does not match the optimizer"
+            )
+
+    def step(self) -> None:
+        if self.world_size > 1:
+            self._require_group()
+        grad_flat = flatten_grads(self.model)
+        grad_padded = pad_flat(grad_flat, self.spec)
+        if self.world_size > 1:
+            grad_shard = torch.empty(
+                self.spec.shard_numel,
+                dtype=self.compute_dtype,
+                device=self.device,
+            )
+            dist.reduce_scatter_tensor(
+                grad_shard, grad_padded, op=dist.ReduceOp.SUM
+            )
+            self.comm.reduce_scatter_calls += 1
+            self.comm.reduce_scatter_bytes += (
+                grad_padded.numel() * grad_padded.element_size()
+            )
+        else:
+            grad_shard = grad_padded.narrow(0, 0, self.spec.shard_numel)
+
+        grad_fp32 = grad_shard.to(torch.float32)
+        if self.world_size > 1:
+            grad_fp32.div_(self.world_size)
+
+        self.step_count += 1
+        beta1, beta2 = self.betas
+        bias_correction1 = 1.0 - beta1**self.step_count
+        bias_correction2 = 1.0 - beta2**self.step_count
+        if self.weight_decay:
+            grad_fp32 = grad_fp32.add(
+                self.master, alpha=self.weight_decay
+            )
+        self.exp_avg.mul_(beta1).add_(grad_fp32, alpha=1.0 - beta1)
+        self.exp_avg_sq.mul_(beta2).addcmul_(
+            grad_fp32, grad_fp32, value=1.0 - beta2
+        )
+        denominator = (
+            self.exp_avg_sq.sqrt()
+            .div_(math.sqrt(bias_correction2))
+            .add_(self.eps)
+        )
+        self.master.addcdiv_(
+            self.exp_avg,
+            denominator,
+            value=-self.lr / bias_correction1,
+        )
+
+        param_shard = self.master.to(self.compute_dtype)
+        if self.world_size > 1:
+            full = torch.empty(
+                self.spec.padded_numel,
+                dtype=self.compute_dtype,
+                device=self.device,
+            )
+            dist.all_gather_into_tensor(full, param_shard)
+            self.comm.allgather_calls += 1
+            self.comm.allgather_bytes += full.numel() * full.element_size()
+        else:
+            full = param_shard
+        unflatten_into(
+            self.model, full.narrow(0, 0, self.total_numel)
+        )
+
+    def state_nbytes(self) -> int:
+        return (
+            self.master.nbytes
+            + self.exp_avg.nbytes
+            + self.exp_avg_sq.nbytes
+        )
+
+
+def measure_memory(
+    model: nn.Module, optimizer: Zero1Optimizer
+) -> MemoryProfile:
+    params_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in model.parameters()
+    )
+    grads_bytes = sum(
+        parameter.grad.numel() * parameter.grad.element_size()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
+    optimizer_bytes = optimizer.state_nbytes()
+    formula_bytes = 12 * optimizer.total_numel // optimizer.world_size
+    return MemoryProfile(
+        params_bytes=params_bytes,
+        grads_bytes=grads_bytes,
+        optimizer_bytes=optimizer_bytes,
+        total_bytes=params_bytes + grads_bytes + optimizer_bytes,
+        formula_bytes=formula_bytes,
+        formula_ok=optimizer_bytes == formula_bytes,
+    )
