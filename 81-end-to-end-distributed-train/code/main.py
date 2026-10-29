@@ -364,18 +364,6 @@ class ShardSpec:
     def owns_any(self) -> bool:
         return self.start < self.end
 
-    def as_dict(self) -> dict[str, int]:
-        return {
-            "total_numel": self.total_numel,
-            "world_size": self.world_size,
-            "rank": self.rank,
-            "shard_numel": self.shard_numel,
-            "padded_numel": self.padded_numel,
-            "start": self.start,
-            "end": self.end,
-            "local_numel": self.local_numel,
-        }
-
 
 def shard_spec(total_numel: int, world_size: int, rank: int) -> ShardSpec:
     if type(total_numel) is not int or total_numel < 1:
@@ -740,18 +728,6 @@ def encode_fp16(values: Iterable[float]) -> bytes:
                 "value cannot be encoded as IEEE-754 binary16"
             ) from exc
     return bytes(encoded)
-
-
-def decode_fp16(data: bytes) -> array:
-    if not isinstance(data, (bytes, bytearray, memoryview)):
-        raise TypeError("fp16 data must be bytes-like")
-    if len(data) % 2:
-        raise ValueError("fp16 payload length must be a multiple of 2")
-    values = array("f")
-    for offset in range(0, len(data), 1024 * 2):
-        count = min(1024, (len(data) - offset) // 2)
-        values.extend(struct.unpack_from(f"<{count}e", data, offset))
-    return values
 
 
 @dataclass(frozen=True)
