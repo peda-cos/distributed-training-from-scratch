@@ -1773,7 +1773,9 @@ def print_report(
             f"rank{payload['rank']} "
             f"{'byte-equal' if payload['resume_verified'] else 'MISMATCH'}"
         )
-    verified = all(bool(payload.get("resume_verified")) for payload in ordered)
+    verified = loaded is not None and all(
+        bool(payload.get("resume_verified")) for payload in ordered
+    )
     print(
         f"RESUME VERIFIED ({len(ordered)}/{config.world_size} rank shards byte-equal)"
         if verified
